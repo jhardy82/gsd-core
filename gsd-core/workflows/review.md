@@ -1,4 +1,4 @@
-<purpose>
+[Resource from plugin:github:github at repo://jhardy82/gsd-core/sha/db725e49e0d7be6b0a4e92bf1344e66b3e8869f5/contents/gsd-core/workflows/review.md] <purpose>
 Cross-AI peer review — invoke external AI CLIs to independently review phase plans.
 Each CLI gets the same prompt (PROJECT.md context, phase plans, requirements) and
 produces structured feedback. Results are combined into REVIEWS.md for the planner
@@ -324,6 +324,53 @@ reviewer instance with `"agent": "review"` (see
 is the durable fix when this recurs.
 
 ```bash
+# Resolve prompt budget for OpenCode: per-reviewer override > global default > null.
+# OpenCode was the only prompt-fed lane with no trimming: a small-context model
+# (e.g. a local Ollama backend) silently truncates an oversize prompt and
+# confabulates a review while exiting 0 — the empty-output guards below never
+# fire. Trim to budget exactly like the Ollama/LM Studio/llama.cpp lanes.
+OPENCODE_REVIEWER_BUDGET=$(gsd_run query config-get review.max_prompt_tokens_per_reviewer.opencode 2>/dev/null | jq -r '.' 2>/dev/null || echo "null")
+if [ -z "$OPENCODE_REVIEWER_BUDGET" ] || [ "$OPENCODE_REVIEWER_BUDGET" = "null" ]; then
+  OPENCODE_REVIEWER_BUDGET=$(gsd_run query config-get review.max_prompt_tokens 2>/dev/null | jq -r '.' 2>/dev/null || echo "null")
+fi
+
+OPENCODE_PROMPT_FILE="/tmp/gsd-review-prompt-{phase}.md"
+OPENCODE_SKIP=0
+if [ -n "$OPENCODE_REVIEWER_BUDGET" ] && [ "$OPENCODE_REVIEWER_BUDGET" != "null" ] && [ "$OPENCODE_REVIEWER_BUDGET" != "0" ]; then
+  PLAN_FILE_ARGS=""
+  for p in /tmp/gsd-review-{phase}-plan-*.md; do
+    [ -f "$p" ] && PLAN_FILE_ARGS="$PLAN_FILE_ARGS --plan-file $p"
+  done
+  PROJECT_ARG=""
+  [ -f "/tmp/gsd-review-{phase}-project.md" ] && PROJECT_ARG="--project-file /tmp/gsd-review-{phase}-project.md"
+  CONTEXT_ARG=""
+  [ -f "/tmp/gsd-review-{phase}-context.md" ] && CONTEXT_ARG="--context-file /tmp/gsd-review-{phase}-context.md"
+  RESEARCH_ARG=""
+  [ -f "/tmp/gsd-review-{phase}-research.md" ] && RESEARCH_ARG="--research-file /tmp/gsd-review-{phase}-research.md"
+  REQUIREMENTS_ARG=""
+  [ -f "/tmp/gsd-review-{phase}-requirements.md" ] && REQUIREMENTS_ARG="--requirements-file /tmp/gsd-review-{phase}-requirements.md"
+
+  gsd_run query prompt-budget \
+    --budget "$OPENCODE_REVIEWER_BUDGET" \
+    --instructions-file "/tmp/gsd-review-{phase}-instructions.md" \
+    --roadmap-file "/tmp/gsd-review-{phase}-roadmap.md" \
+    $PLAN_FILE_ARGS $PROJECT_ARG $CONTEXT_ARG $RESEARCH_ARG $REQUIREMENTS_ARG \
+    --output-prompt "/tmp/gsd-review-prompt-{phase}-opencode.md" \
+    --output-metadata "/tmp/gsd-review-prompt-{phase}-opencode.metadata.json"
+  OPENCODE_EXIT=$?
+  if [ $OPENCODE_EXIT -ne 0 ]; then
+    if [ $OPENCODE_EXIT -eq 2 ] || [ $OPENCODE_EXIT -eq 11 ]; then
+      echo "WARNING: prompt budget for opencode (${OPENCODE_REVIEWER_BUDGET} tokens) is too small for the minimum review set. Skipping OpenCode reviewer." >&2
+    else
+      echo "WARNING: prompt-budget returned unexpected exit code ${OPENCODE_EXIT} for opencode. Skipping OpenCode reviewer." >&2
+    fi
+    OPENCODE_SKIP=1
+  else
+    OPENCODE_PROMPT_FILE="/tmp/gsd-review-prompt-{phase}-opencode.md"
+  fi
+fi
+
+if [ "$OPENCODE_SKIP" != "1" ]; then
 # stderr → sidecar (never /dev/null) so a real error is diagnosable — mirrors the
 # Codex block. --format json is the primary invocation (not a fallback): the review
 # text lives in assistant `text` parts, which the default formatter drops when the
@@ -333,7 +380,7 @@ if [ -n "$OPENCODE_MODEL" ] && [ "$OPENCODE_MODEL" != "null" ]; then
 else
   set --
 fi
-cat /tmp/gsd-review-prompt-{phase}.md | opencode run "$@" --format json - 2>/tmp/gsd-review-opencode-{phase}.err > /tmp/gsd-review-opencode-{phase}.json
+cat "$OPENCODE_PROMPT_FILE" | opencode run "$@" --format json - 2>/tmp/gsd-review-opencode-{phase}.err > /tmp/gsd-review-opencode-{phase}.json
 # Reconstruct the review from the assistant text parts. Capture into a variable and
 # test its CONTENT (not the output file's size): an empty extraction still prints a
 # trailing newline, which would fool a `[ -s file ]` check into skipping the stub.
@@ -349,6 +396,7 @@ else
     echo "stderr:"
     cat /tmp/gsd-review-opencode-{phase}.err
   } > /tmp/gsd-review-opencode-{phase}.md
+fi
 fi
 ```
 
